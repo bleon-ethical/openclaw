@@ -1,54 +1,92 @@
-export type PollCreationParamKind = "string" | "stringArray" | "number" | "boolean";
+// Parses poll command parameters into validated polling options.
+import { parseStrictFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { readSnakeCaseParamRaw } from "./param-key.js";
 
-export type PollCreationParamDef = {
+type PollCreationParamKind = "string" | "stringArray" | "positiveInteger" | "boolean";
+
+type PollCreationParamDef = {
   kind: PollCreationParamKind;
-  telegramOnly?: boolean;
 };
 
-export const POLL_CREATION_PARAM_DEFS: Record<string, PollCreationParamDef> = {
+const SHARED_POLL_CREATION_PARAM_DEFS = {
   pollQuestion: { kind: "string" },
   pollOption: { kind: "stringArray" },
-  pollDurationHours: { kind: "number" },
+  pollDurationHours: { kind: "positiveInteger" },
   pollMulti: { kind: "boolean" },
-  pollDurationSeconds: { kind: "number", telegramOnly: true },
-  pollAnonymous: { kind: "boolean", telegramOnly: true },
-  pollPublic: { kind: "boolean", telegramOnly: true },
-};
+} satisfies Record<string, PollCreationParamDef>;
 
-export type PollCreationParamName = keyof typeof POLL_CREATION_PARAM_DEFS;
+export const POLL_CREATION_PARAM_DEFS: Record<string, PollCreationParamDef> =
+  SHARED_POLL_CREATION_PARAM_DEFS;
 
-export const POLL_CREATION_PARAM_NAMES = Object.keys(POLL_CREATION_PARAM_DEFS);
+type SharedPollCreationParamName = keyof typeof SHARED_POLL_CREATION_PARAM_DEFS;
 
-function toSnakeCaseKey(key: string): string {
-  return key
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .toLowerCase();
-}
+export const SHARED_POLL_CREATION_PARAM_NAMES = Object.keys(
+  SHARED_POLL_CREATION_PARAM_DEFS,
+) as SharedPollCreationParamName[];
+const SHARED_POLL_CREATION_PARAM_KEY_SET = new Set(
+  SHARED_POLL_CREATION_PARAM_NAMES.map(normalizePollParamKey),
+);
+const POLL_VOTE_PARAM_KEY_SET = new Set(
+  ["pollId", "pollOptionId", "pollOptionIds", "pollOptionIndex", "pollOptionIndexes"].map(
+    normalizePollParamKey,
+  ),
+);
 
 function readPollParamRaw(params: Record<string, unknown>, key: string): unknown {
-  if (Object.hasOwn(params, key)) {
-    return params[key];
-  }
-  const snakeKey = toSnakeCaseKey(key);
-  if (snakeKey !== key && Object.hasOwn(params, snakeKey)) {
-    return params[snakeKey];
-  }
-  return undefined;
+  return readSnakeCaseParamRaw(params, key);
 }
 
-export function resolveTelegramPollVisibility(params: {
-  pollAnonymous?: boolean;
-  pollPublic?: boolean;
-}): boolean | undefined {
-  if (params.pollAnonymous && params.pollPublic) {
-    throw new Error("pollAnonymous and pollPublic are mutually exclusive");
-  }
-  return params.pollAnonymous ? true : params.pollPublic ? false : undefined;
+function normalizePollParamKey(key: string): string {
+  return normalizeLowercaseStringOrEmpty(key.replaceAll("_", ""));
 }
 
-export function hasPollCreationParams(params: Record<string, unknown>): boolean {
-  for (const key of POLL_CREATION_PARAM_NAMES) {
+function isChannelPollCreationParamName(key: string): boolean {
+  const normalized = normalizePollParamKey(key);
+  return (
+    normalized.startsWith("poll") &&
+    !SHARED_POLL_CREATION_PARAM_KEY_SET.has(normalized) &&
+    !POLL_VOTE_PARAM_KEY_SET.has(normalized)
+  );
+}
+
+function hasExplicitUnknownPollValue(key: string, value: unknown): boolean {
+  if (value === true) {
+    return true;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value !== 0;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+      return false;
+    }
+    if (normalizePollParamKey(key).includes("duration")) {
+      const parsed = parseStrictFiniteNumber(trimmed);
+      return Number.isFinite(parsed) && parsed !== 0;
+    }
+    const normalized = normalizeLowercaseStringOrEmpty(trimmed);
+    return normalized !== "false" && normalized !== "0";
+  }
+  if (Array.isArray(value)) {
+    return value.some((entry) => hasExplicitUnknownPollValue(key, entry));
+  }
+  return false;
+}
+
+// Among the shared poll params, only the content-bearing fields (pollQuestion,
+// pollOption) signal poll intent on their own. The modifier fields
+// (pollDurationHours, pollMulti) are exposed by the shared `message` tool
+// schema for both `send` and `poll` actions, so LLMs routinely echo their
+// schema-implied defaults (`1`, `false`) on plain `send` calls — see issue
+// for context. Treating those modifier defaults as "the agent meant to create
+// a poll" produces false positives and blocks routine sends. The modifiers
+// only count when accompanied by a content-bearing field.
+const CONTENT_BEARING_SHARED_POLL_PARAM_NAMES = ["pollQuestion", "pollOption"] as const;
+
+function hasContentBearingPollCreationParam(params: Record<string, unknown>): boolean {
+  for (const key of CONTENT_BEARING_SHARED_POLL_PARAM_NAMES) {
     const def = POLL_CREATION_PARAM_DEFS[key];
     const value = readPollParamRaw(params, key);
     if (def.kind === "string" && typeof value === "string" && value.trim().length > 0) {
@@ -65,24 +103,21 @@ export function hasPollCreationParams(params: Record<string, unknown>): boolean 
         return true;
       }
     }
-    if (def.kind === "number") {
-      if (typeof value === "number" && Number.isFinite(value)) {
-        return true;
-      }
-      if (typeof value === "string") {
-        const trimmed = value.trim();
-        if (trimmed.length > 0 && Number.isFinite(Number(trimmed))) {
-          return true;
-        }
-      }
-    }
-    if (def.kind === "boolean") {
-      if (value === true) {
-        return true;
-      }
-      if (typeof value === "string" && value.trim().toLowerCase() === "true") {
-        return true;
-      }
+  }
+  return false;
+}
+
+export function hasPollCreationParams(params: Record<string, unknown>): boolean {
+  if (hasContentBearingPollCreationParam(params)) {
+    return true;
+  }
+  // Channel-specific poll-prefixed params (e.g. pollDurationSeconds,
+  // pollPublic) are not part of the shared schema, so an explicit value still
+  // indicates deliberate poll intent and continues to trigger the validator
+  // even without a pollQuestion/pollOption.
+  for (const [key, value] of Object.entries(params)) {
+    if (isChannelPollCreationParamName(key) && hasExplicitUnknownPollValue(key, value)) {
+      return true;
     }
   }
   return false;
