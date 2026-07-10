@@ -13,6 +13,9 @@ import { getRuntimeConfig } from "../config/io.js";
 import { loadManifestMetadataSnapshot } from "../plugins/manifest-contract-eligibility.js";
 import {
   buildAgentMainSessionKey,
+  isAcpSessionKey,
+  isCronSessionKey,
+  isSubagentSessionKey,
   isValidAgentId,
   normalizeAgentId,
 } from "../routing/session-key.js";
@@ -42,15 +45,28 @@ export const OPENCLAW_MODEL_ID = "openclaw";
 /** Default OpenAI-compatible model alias that targets the default OpenClaw agent. */
 export const OPENCLAW_DEFAULT_MODEL_ID = "openclaw/default";
 
-export class UnknownGatewayAgentError extends Error {
+class UnknownGatewayAgentError extends Error {
   constructor(readonly agentId: string) {
     super(`Unknown agent '${agentId}'.`);
     this.name = "UnknownGatewayAgentError";
   }
 }
 
+export class GatewaySessionKeyOverrideError extends Error {
+  constructor() {
+    super("`x-openclaw-session-key` cannot use reserved internal session namespaces.");
+    this.name = "GatewaySessionKeyOverrideError";
+  }
+}
+
 export function isUnknownGatewayAgentError(err: unknown): err is UnknownGatewayAgentError {
   return err instanceof UnknownGatewayAgentError;
+}
+
+export function isGatewaySessionKeyOverrideError(
+  err: unknown,
+): err is GatewaySessionKeyOverrideError {
+  return err instanceof GatewaySessionKeyOverrideError;
 }
 
 function assertKnownAgentId(agentId: string, cfg = getRuntimeConfig()): void {
@@ -185,12 +201,27 @@ function resolveSessionKey(params: {
 }): string {
   const explicit = getHeader(params.req, "x-openclaw-session-key")?.trim();
   if (explicit) {
+    if (isReservedSessionKeyOverride(explicit)) {
+      throw new GatewaySessionKeyOverrideError();
+    }
     return explicit;
   }
 
   const user = params.user?.trim();
   const mainKey = user ? `${params.prefix}-user:${user}` : `${params.prefix}:${randomUUID()}`;
   return buildAgentMainSessionKey({ agentId: params.agentId, mainKey });
+}
+
+function isReservedSessionKeyOverride(sessionKey: string): boolean {
+  const lowered = normalizeLowercaseStringOrEmpty(sessionKey);
+  return (
+    lowered.startsWith("subagent:") ||
+    lowered.startsWith("cron:") ||
+    lowered.startsWith("acp:") ||
+    isSubagentSessionKey(sessionKey) ||
+    isCronSessionKey(sessionKey) ||
+    isAcpSessionKey(sessionKey)
+  );
 }
 
 /** Resolves gateway agent/session/channel context for OpenAI-compatible handlers. */

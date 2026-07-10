@@ -1,11 +1,12 @@
 // Cron stagger tests cover deterministic schedule spreading across jobs.
 import { describe, expect, it } from "vitest";
 import {
-  DEFAULT_TOP_OF_HOUR_STAGGER_MS,
   isRecurringTopOfHourCronExpr,
   normalizeCronStaggerMs,
   resolveCronStaggerMs,
 } from "./stagger.js";
+
+const DEFAULT_TOP_OF_HOUR_STAGGER_MS = 5 * 60 * 1000;
 
 describe("cron stagger helpers", () => {
   it("detects recurring top-of-hour cron expressions for 5-field and 6-field cron", () => {
@@ -33,6 +34,7 @@ describe("cron stagger helpers", () => {
     expect(normalizeCronStaggerMs("abc")).toBeUndefined();
     expect(normalizeCronStaggerMs("1e3")).toBeUndefined();
     expect(normalizeCronStaggerMs("0x10")).toBeUndefined();
+    expect(normalizeCronStaggerMs(Number.MAX_SAFE_INTEGER + 1)).toBeUndefined();
   });
 
   it("resolves effective stagger for cron schedules", () => {

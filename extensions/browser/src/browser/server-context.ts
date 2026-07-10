@@ -231,7 +231,11 @@ export function createBrowserRouteContext(opts: ContextOptions): BrowserRouteCon
 
       result.push({
         name,
-        transport: capabilities.usesChromeMcp ? "chrome-mcp" : "cdp",
+        transport: capabilities.usesChromeMcp
+          ? "chrome-mcp"
+          : capabilities.mode === "local-extension"
+            ? "extension"
+            : "cdp",
         cdpPort: capabilities.usesChromeMcp ? null : profile.cdpPort,
         cdpUrl: profile.cdpUrl ? (redactCdpUrl(profile.cdpUrl) ?? null) : null,
         color: profile.color,
@@ -265,15 +269,16 @@ export function createBrowserRouteContext(opts: ContextOptions): BrowserRouteCon
     listProfiles,
     // Legacy methods delegate to default profile
     ensureBrowserAvailable: () => getDefaultContext().ensureBrowserAvailable(),
-    ensureTabAvailable: (targetId) => getDefaultContext().ensureTabAvailable(targetId),
+    ensureTabAvailable: (targetId, options) =>
+      getDefaultContext().ensureTabAvailable(targetId, options),
     isHttpReachable: (timeoutMs) => getDefaultContext().isHttpReachable(timeoutMs),
     isTransportAvailable: (timeoutMs) => getDefaultContext().isTransportAvailable(timeoutMs),
     isReachable: (timeoutMs, options) => getDefaultContext().isReachable(timeoutMs, options),
     listTabs: () => getDefaultContext().listTabs(),
     openTab: (url, optsLocal) => getDefaultContext().openTab(url, optsLocal),
     labelTab: (targetId, label) => getDefaultContext().labelTab(targetId, label),
-    focusTab: (targetId) => getDefaultContext().focusTab(targetId),
-    closeTab: (targetId) => getDefaultContext().closeTab(targetId),
+    focusTab: (targetId, options) => getDefaultContext().focusTab(targetId, options),
+    closeTab: (targetId, options) => getDefaultContext().closeTab(targetId, options),
     stopRunningBrowser: () => getDefaultContext().stopRunningBrowser(),
     resetProfile: () => getDefaultContext().resetProfile(),
     mapTabError,

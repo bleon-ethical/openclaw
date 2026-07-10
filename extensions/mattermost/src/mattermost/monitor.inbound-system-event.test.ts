@@ -45,7 +45,9 @@ class FakeWebSocket {
 
   close(): void {}
 
-  terminate(): void {}
+  terminate(): void {
+    this.emitClose(1000);
+  }
 
   get openListenerCount(): number {
     return this.openListeners.length;
@@ -104,11 +106,11 @@ vi.mock("./client.js", async () => {
 });
 
 vi.mock("./draft-stream.js", () => ({
-  buildMattermostToolStatusText: () => "Working",
   createMattermostDraftStream: mockState.createMattermostDraftStream,
 }));
 
-vi.mock("./monitor-resources.js", () => ({
+vi.mock("./monitor-resources.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./monitor-resources.js")>()),
   createMattermostMonitorResources: () => ({
     resolveMattermostMedia: mockState.resolveMattermostMedia,
     sendTypingIndicator: vi.fn(async () => {}),
@@ -157,6 +159,7 @@ function createRuntimeCore(
     shouldHandleTextCommands?: () => boolean;
     textHasControlCommand?: (text?: string) => boolean;
     createInboundDebouncer?: typeof createInboundDebouncer;
+    verboseDebug?: (message: string) => void;
   } = {},
 ) {
   const dispatchPreparedForTest = vi.fn(
@@ -221,9 +224,9 @@ function createRuntimeCore(
       current: () => cfg,
     },
     logging: {
-      shouldLogVerbose: () => false,
+      shouldLogVerbose: () => Boolean(overrides.verboseDebug),
       getChildLogger: () => ({
-        debug: vi.fn(),
+        debug: overrides.verboseDebug ?? vi.fn(),
         info: vi.fn(),
         warn: vi.fn(),
         error: vi.fn(),
@@ -420,7 +423,7 @@ describe("mattermost inbound user posts", () => {
         channel_display_name: "Town Square",
         sender_name: "alice",
         post: JSON.stringify({
-          id: "post-1",
+          id: "post-inbound-system-event-regular",
           channel_id: "chan-1",
           user_id: "user-1",
           message: "hello from mattermost",
@@ -440,18 +443,114 @@ describe("mattermost inbound user posts", () => {
     const ctx = mockState.dispatchReplyFromConfig.mock.calls.at(0)?.[0].ctx;
     expect(ctx?.BodyForAgent).toBe("hello from mattermost");
     expect(ctx?.ConversationLabel).toBe("Town Square id:chan-1");
-    expect(ctx?.MessageSid).toBe("post-1");
+    expect(ctx?.MessageSid).toBe("post-inbound-system-event-regular");
     expect(ctx?.OriginatingChannel).toBe("mattermost");
     expect(ctx?.Provider).toBe("mattermost");
   });
 
-  it("merges Mattermost progress preview updates by line identity", async () => {
+  it("keeps verbose inbound previews on complete UTF-16 boundaries", async () => {
+    const socket = new FakeWebSocket();
+    const abortController = new AbortController();
+    const verboseDebug = vi.fn();
+    mockState.abortController = abortController;
+    mockState.runtimeCore = createRuntimeCore(testConfig, undefined, { verboseDebug });
+
+    const monitor = monitorMattermostProvider({
+      config: testConfig,
+      runtime: testRuntime(),
+      abortSignal: abortController.signal,
+      webSocketFactory: () => socket,
+    });
+
+    await vi.waitFor(() => {
+      expect(socket.openListenerCount).toBeGreaterThan(0);
+    });
+    socket.emitOpen();
+
+    await socket.emitMessage({
+      event: "posted",
+      data: {
+        channel_id: "chan-1",
+        channel_name: "town-square",
+        channel_display_name: "Town Square",
+        sender_name: "alice",
+        post: JSON.stringify({
+          id: "post-verbose-preview",
+          channel_id: "chan-1",
+          user_id: "user-1",
+          message: `${"a".repeat(199)}😀tail`,
+          create_at: 1_714_000_000_000,
+        }),
+      },
+      broadcast: {
+        channel_id: "chan-1",
+        user_id: "user-1",
+      },
+    });
+    socket.emitClose(1000);
+    await monitor;
+
+    expect(verboseDebug).toHaveBeenCalledWith(
+      `mattermost inbound: from=mattermost:channel:chan-1 len=205 preview="${"a".repeat(199)}"`,
+    );
+  });
+
+  it("dispatches a bare bot mention whose body is empty after normalization as a wake event", async () => {
+    const socket = new FakeWebSocket();
+    const abortController = new AbortController();
+    mockState.abortController = abortController;
+
+    const monitor = monitorMattermostProvider({
+      config: testConfig,
+      runtime: testRuntime(),
+      abortSignal: abortController.signal,
+      webSocketFactory: () => socket,
+    });
+
+    await vi.waitFor(() => {
+      expect(socket.openListenerCount).toBeGreaterThan(0);
+    });
+    socket.emitOpen();
+
+    await socket.emitMessage({
+      event: "posted",
+      data: {
+        channel_id: "chan-1",
+        channel_name: "town-square",
+        channel_display_name: "Town Square",
+        sender_name: "alice",
+        post: JSON.stringify({
+          id: "post-bare-mention",
+          channel_id: "chan-1",
+          user_id: "user-1",
+          message: "@openclaw",
+          create_at: 1_714_000_000_001,
+        }),
+      },
+      broadcast: {
+        channel_id: "chan-1",
+        user_id: "user-1",
+      },
+    });
+    socket.emitClose(1000);
+    await monitor;
+
+    expect(mockState.dispatchReplyFromConfig).toHaveBeenCalledTimes(1);
+    const ctx = mockState.dispatchReplyFromConfig.mock.calls.at(0)?.[0].ctx;
+    expect(ctx?.BodyForAgent).toBe("@openclaw");
+    expect(ctx?.MessageSid).toBe("post-bare-mention");
+    expect(ctx?.OriginatingChannel).toBe("mattermost");
+    expect(ctx?.Provider).toBe("mattermost");
+  });
+
+  it("merges Mattermost progress preview updates and clears after message-tool delivery", async () => {
     const socket = new FakeWebSocket();
     const abortController = new AbortController();
     mockState.abortController = abortController;
     const draftStream = {
       update: vi.fn(),
       flush: vi.fn(async () => {}),
+      clear: vi.fn(async () => {}),
       stop: vi.fn(async () => {}),
     };
     mockState.createMattermostDraftStream.mockReturnValue(draftStream);
@@ -505,6 +604,7 @@ describe("mattermost inbound user posts", () => {
         status: "completed",
         progressText: "done",
       });
+      await params.replyOptions?.onObservedReplyDelivery?.();
       abortController.abort();
     });
 
@@ -543,6 +643,9 @@ describe("mattermost inbound user posts", () => {
     socket.emitClose(1000);
     await monitor;
 
+    const replyOptions = mockState.dispatchReplyFromConfig.mock.calls.at(0)?.[0].replyOptions;
+    expect(replyOptions?.allowProgressCallbacksWhenSourceDeliverySuppressed).toBe(true);
+    expect(draftStream.clear).toHaveBeenCalledTimes(1);
     const updates = draftStream.update.mock.calls.map((call) => String(call[0]));
     expect(updates.at(-1)).toContain("Read");
     expect(updates.at(-1)).toContain("Exec");

@@ -27,23 +27,17 @@ import * as openClawPluginTools from "./openclaw-plugin-tools.js";
 import { createOpenClawTools } from "./openclaw-tools.js";
 import { expectReadWriteEditTools } from "./test-helpers/agent-tools-fs-helpers.js";
 import { createAgentToolsSandboxContext } from "./test-helpers/agent-tools-sandbox-context.js";
+import { stubTool } from "./test-helpers/fast-tool-stubs.js";
 import { createHostSandboxFsBridge } from "./test-helpers/host-sandbox-fs-bridge.js";
 import { buildEmptyExplicitToolAllowlistError } from "./tool-allowlist-guard.js";
 import { DEFAULT_PLUGIN_TOOLS_ALLOWLIST_ENTRY, normalizeToolName } from "./tool-policy.js";
+import { replaceWithEffectiveCronCreatorToolAllowlist } from "./tools/cron-tool.js";
 
 const tinyPngBuffer = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2f7z8AAAAASUVORK5CYII=",
   "base64",
 );
-const XAI_UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
-  "minLength",
-  "maxLength",
-  "minItems",
-  "maxItems",
-  "minContains",
-  "maxContains",
-]);
-
+const XAI_UNSUPPORTED_SCHEMA_KEYWORDS = new Set(["minContains", "maxContains"]);
 function collectActionValues(schema: unknown, values: Set<string>): void {
   if (!schema || typeof schema !== "object") {
     return;
@@ -152,6 +146,12 @@ function expectListIncludes(
   for (const value of expected) {
     expect(list.includes(value)).toBe(true);
   }
+}
+
+function cronCreatorToolNames(
+  list: OpenClawToolsOptions["cronCreatorToolAllowlist"] | undefined,
+): string[] | undefined {
+  return list?.map((entry) => (typeof entry === "string" ? entry : entry.name));
 }
 
 describe("createOpenClawCodingTools", () => {
@@ -432,6 +432,83 @@ describe("createOpenClawCodingTools", () => {
     expect(toolNameList(tools)).toContain("message");
   });
 
+  it("preserves configured media tools through local model lean filtering", () => {
+    const tools = createOpenClawCodingTools({
+      config: {
+        agents: {
+          defaults: {
+            experimental: {
+              localModelLean: true,
+            },
+          },
+          list: [
+            {
+              id: "artist",
+              tools: {
+                alsoAllow: ["video_generate"],
+                byProvider: {
+                  ollama: {
+                    alsoAllow: ["tts"],
+                  },
+                },
+              },
+            },
+          ],
+        },
+        tools: {
+          alsoAllow: ["pdf"],
+          byProvider: {
+            "ollama/qwen3.5:9b": {
+              alsoAllow: ["image_generate"],
+            },
+          },
+        },
+      },
+      agentId: "artist",
+      modelProvider: "ollama",
+      modelId: "qwen3.5:9b",
+      toolConstructionPlan: {
+        includeBaseCodingTools: false,
+        includeShellTools: false,
+        includeChannelTools: false,
+        includeOpenClawTools: true,
+        includePluginTools: false,
+      },
+    });
+
+    expect(toolNameList(tools)).toEqual(
+      expect.arrayContaining(["image_generate", "pdf", "tts", "video_generate"]),
+    );
+  });
+
+  it("does not treat built-in profile tools as lean-mode overrides", () => {
+    const tools = createOpenClawCodingTools({
+      config: {
+        agents: {
+          defaults: {
+            experimental: {
+              localModelLean: true,
+            },
+          },
+        },
+        tools: {
+          profile: "coding",
+        },
+      },
+      toolConstructionPlan: {
+        includeBaseCodingTools: false,
+        includeShellTools: false,
+        includeChannelTools: false,
+        includeOpenClawTools: true,
+        includePluginTools: false,
+      },
+    });
+
+    expect(toolNameList(tools)).not.toEqual(
+      expect.arrayContaining(["image_generate", "video_generate"]),
+    );
+  });
+
   it("preserves forced message through local model lean filtering without runtime allowlist", () => {
     const tools = createOpenClawCodingTools({
       config: {
@@ -512,6 +589,53 @@ describe("createOpenClawCodingTools", () => {
 
     expect(createOpenClawToolsMock).toHaveBeenCalledTimes(1);
     expect(latestCreateOpenClawToolsOptions().sourceReplyDeliveryMode).toBe("message_tool_only");
+  });
+
+  it("passes configured filesystem policy to OpenClaw tool construction", () => {
+    const createOpenClawToolsMock = vi.mocked(createOpenClawTools);
+    createOpenClawToolsMock.mockClear();
+
+    createOpenClawCodingTools({
+      config: { tools: { fs: { workspaceOnly: true } } },
+    });
+
+    expect(latestCreateOpenClawToolsOptions().fsPolicy).toEqual({ workspaceOnly: true });
+  });
+
+  it("uses the canonical spawn workspace for follow-up task suggestions", () => {
+    const createOpenClawToolsMock = vi.mocked(createOpenClawTools);
+    createOpenClawToolsMock.mockClear();
+    const sandboxDir = "/sandbox/workspace";
+
+    createOpenClawCodingTools({
+      sandbox: createAgentToolsSandboxContext({
+        workspaceDir: sandboxDir,
+        workspaceAccess: "ro",
+        fsBridge: createHostSandboxFsBridge(sandboxDir),
+      }),
+      workspaceDir: "/agent/workspace",
+      cwd: sandboxDir,
+      spawnWorkspaceDir: "/host/project",
+    });
+
+    expect(latestCreateOpenClawToolsOptions()).toMatchObject({
+      workspaceDir: "/agent/workspace",
+      spawnWorkspaceDir: "/host/project",
+      cwd: "/host/project",
+    });
+  });
+
+  it("keeps an unsandboxed task repo as the follow-up suggestion cwd", () => {
+    const createOpenClawToolsMock = vi.mocked(createOpenClawTools);
+    createOpenClawToolsMock.mockClear();
+
+    createOpenClawCodingTools({
+      workspaceDir: "/agent/workspace",
+      cwd: "/task/repo",
+      spawnWorkspaceDir: "/agent/workspace",
+    });
+
+    expect(latestCreateOpenClawToolsOptions().cwd).toBe("/task/repo");
   });
 
   it("skips unrelated tool families when construction is planned from a narrow allowlist", () => {
@@ -607,6 +731,33 @@ describe("createOpenClawCodingTools", () => {
       const pluginToolOptions = resolvePluginToolsSpy.mock.calls[0]?.[0].options;
       expect(pluginToolOptions?.modelProvider).toBe("openrouter");
       expect(pluginToolOptions?.modelId).toBe("openrouter/auto");
+    } finally {
+      resolvePluginToolsSpy.mockRestore();
+    }
+  });
+
+  it("forwards owner identity to plugin-only tool construction", () => {
+    const resolvePluginToolsSpy = vi
+      .spyOn(openClawPluginTools, "resolveOpenClawPluginToolsForOptions")
+      .mockReturnValue([]);
+
+    try {
+      createOpenClawCodingTools({
+        config: testConfig,
+        includeCoreTools: false,
+        runtimeToolAllowlist: ["codex_threads"],
+        senderIsOwner: true,
+        toolConstructionPlan: {
+          includeBaseCodingTools: false,
+          includeShellTools: false,
+          includeChannelTools: false,
+          includeOpenClawTools: false,
+          includePluginTools: true,
+        },
+      });
+
+      expect(resolvePluginToolsSpy).toHaveBeenCalledTimes(1);
+      expect(resolvePluginToolsSpy.mock.calls[0]?.[0].options?.senderIsOwner).toBe(true);
     } finally {
       resolvePluginToolsSpy.mockRestore();
     }
@@ -737,6 +888,88 @@ describe("createOpenClawCodingTools", () => {
     expectListIncludes(inheritedAllow, ["read", "sessions_spawn"]);
     expect(inheritedAllow?.includes("exec")).toBe(false);
     expect(inheritedAllow?.includes("process")).toBe(false);
+  });
+
+  it("passes group-restricted tool surface to cron-created agent turns", () => {
+    const createOpenClawToolsMock = vi.mocked(createOpenClawTools);
+    createOpenClawToolsMock.mockClear();
+
+    createOpenClawCodingTools({
+      sessionKey: "agent:main:whatsapp:group:restricted-room",
+      config: {
+        tools: { allow: ["read", "exec", "process", "cron"] },
+        channels: {
+          whatsapp: {
+            groups: {
+              "restricted-room": {
+                tools: { allow: ["read", "cron"] },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    expect(createOpenClawToolsMock).toHaveBeenCalledTimes(1);
+    const cronAllow = latestCreateOpenClawToolsOptions().cronCreatorToolAllowlist;
+    const cronAllowNames = cronCreatorToolNames(cronAllow);
+    expectListIncludes(cronAllowNames, ["read", "cron"]);
+    expect(cronAllowNames?.includes("exec")).toBe(false);
+    expect(cronAllowNames?.includes("process")).toBe(false);
+  });
+
+  it("lets embedded attempts refresh a caller-owned cron creator tool surface", () => {
+    const createOpenClawToolsMock = vi.mocked(createOpenClawTools);
+    createOpenClawToolsMock.mockClear();
+    const cronCreatorToolAllowlistRef: NonNullable<
+      OpenClawToolsOptions["cronCreatorToolAllowlist"]
+    > = [];
+
+    createOpenClawCodingTools({
+      config: { tools: { allow: ["read", "cron"] } },
+      cronCreatorToolAllowlistRef,
+    });
+
+    expect(createOpenClawToolsMock).toHaveBeenCalledTimes(1);
+    const cronAllow = latestCreateOpenClawToolsOptions().cronCreatorToolAllowlist;
+    expect(cronAllow).toBe(cronCreatorToolAllowlistRef);
+    expect(cronCreatorToolNames(cronAllow)).toEqual(["read", "cron"]);
+
+    replaceWithEffectiveCronCreatorToolAllowlist(cronCreatorToolAllowlistRef, [
+      stubTool("read"),
+      stubTool("cron"),
+      stubTool("bundle_mcp_search"),
+    ]);
+
+    expect(cronCreatorToolNames(cronAllow)).toEqual(["read", "cron", "bundle_mcp_search"]);
+  });
+
+  it("passes deny-restricted tool surface to cron-created agent turns", () => {
+    const createOpenClawToolsMock = vi.mocked(createOpenClawTools);
+    createOpenClawToolsMock.mockClear();
+
+    createOpenClawCodingTools({
+      sessionKey: "agent:main:whatsapp:group:restricted-room",
+      config: {
+        tools: { allow: ["read", "exec", "process", "cron"] },
+        channels: {
+          whatsapp: {
+            groups: {
+              "restricted-room": {
+                tools: { deny: ["exec", "process"] },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    expect(createOpenClawToolsMock).toHaveBeenCalledTimes(1);
+    const cronAllow = latestCreateOpenClawToolsOptions().cronCreatorToolAllowlist;
+    const cronAllowNames = cronCreatorToolNames(cronAllow);
+    expectListIncludes(cronAllowNames, ["read", "cron"]);
+    expect(cronAllowNames?.includes("exec")).toBe(false);
+    expect(cronAllowNames?.includes("process")).toBe(false);
   });
 
   it("records core tool-prep stages for hot-path diagnostics", () => {
@@ -1279,12 +1512,7 @@ describe("createOpenClawCodingTools", () => {
         `${tool.name}.parameters`,
         XAI_UNSUPPORTED_SCHEMA_KEYWORDS,
       );
-      expect(
-        violations.filter((violation) => {
-          const keyword = violation.split(".").at(-1) ?? "";
-          return XAI_UNSUPPORTED_SCHEMA_KEYWORDS.has(keyword);
-        }),
-      ).toStrictEqual([]);
+      expect(violations).toStrictEqual([]);
     }
   });
 

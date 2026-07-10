@@ -13,6 +13,7 @@ const finalizeSlackPreviewEditMock = vi.fn(async () => {});
 const postMessageMock = vi.fn(async () => ({ ok: true, ts: "171234.999" }));
 const chatUpdateMock = vi.fn(async () => ({ ok: true, ts: "171234.999" }));
 const recordInboundSessionMock = vi.fn(async () => undefined);
+const recordSlackThreadParticipationMock = vi.fn();
 const updateLastRouteMock = vi.fn(async () => {});
 const appendSlackStreamMock = vi.fn(async () => {});
 const startSlackStreamMock = vi.fn(async () => ({
@@ -45,6 +46,8 @@ let capturedReplyOptions:
   | {
       disableBlockStreaming?: boolean;
       suppressDefaultToolProgressMessages?: boolean;
+      allowProgressCallbacksWhenSourceDeliverySuppressed?: boolean;
+      allowToolLifecycleWhenProgressHidden?: boolean;
       onAssistantMessageStart?: () => Promise<void> | void;
       onReasoningEnd?: () => Promise<void> | void;
       onReasoningStream?: (payload?: {
@@ -54,6 +57,7 @@ let capturedReplyOptions:
       onItemEvent?: (payload: {
         kind?: string;
         itemId?: string;
+        toolCallId?: string;
         progressText?: string;
         summary?: string;
         title?: string;
@@ -61,6 +65,15 @@ let capturedReplyOptions:
         phase?: string;
         status?: string;
         meta?: string;
+      }) => Promise<void> | void;
+      onCommandOutput?: (payload: {
+        itemId?: string;
+        toolCallId?: string;
+        phase?: string;
+        title?: string;
+        name?: string;
+        status?: string;
+        exitCode?: number | null;
       }) => Promise<void> | void;
       onToolStart?: (payload: {
         itemId?: string;
@@ -116,6 +129,7 @@ type TestReplyPayload = {
   audioAsVoice?: boolean;
   spokenText?: string;
   ttsSupplement?: { spokenText: string; visibleTextAlreadyDelivered?: boolean };
+  presentation?: { blocks: unknown[] };
 };
 type TestDispatchCounts = Record<TestReplyDispatchKind, number>;
 let mockedDispatchSequence: Array<{
@@ -130,6 +144,7 @@ let mockedReplyOptionEvents: Array<
   | {
       kind: "item";
       itemId?: string;
+      toolCallId?: string;
       itemKind?: string;
       progressText?: string;
       summary?: string;
@@ -159,6 +174,16 @@ let mockedReplyOptionEvents: Array<
       modified?: string[];
       deleted?: string[];
       summary?: string;
+    }
+  | {
+      kind: "command_output";
+      itemId?: string;
+      toolCallId?: string;
+      phase?: string;
+      title?: string;
+      name?: string;
+      status?: string;
+      exitCode?: number | null;
     }
   | { kind: "concurrent_items"; progressTexts: string[] }
   | { kind: "partial"; text: string }
@@ -237,6 +262,29 @@ function taskUpdate(id: unknown, title: string, status: "in_progress" | "complet
   return { type: "task_update", id, title, status };
 }
 
+function collectNativeTaskUpdates() {
+  const chunks: unknown[] = [];
+  const collectChunks = (call: unknown[]) => {
+    const arg = requireRecord(call[0], "native progress call");
+    if (Array.isArray(arg.chunks)) {
+      chunks.push(...arg.chunks);
+    }
+  };
+  for (const call of startSlackStreamMock.mock.calls) {
+    collectChunks(call);
+  }
+  for (const call of appendSlackStreamMock.mock.calls) {
+    collectChunks(call);
+  }
+  for (const call of stopSlackStreamMock.mock.calls) {
+    collectChunks(call);
+  }
+  return chunks.flatMap((chunk) => {
+    const record = requireRecord(chunk, "native progress chunk");
+    return record.type === "task_update" ? [record] : [];
+  });
+}
+
 function expectDeliverReplyCall(index: number, text: string, fields?: Record<string, unknown>) {
   const params = requireRecord(
     requireMockCall(deliverRepliesMock, index, "deliver replies")[0],
@@ -288,10 +336,19 @@ function createPreparedSlackMessage(params?: {
     channelId: string;
     threadTs?: string;
     status: string;
+    loadingMessages?: string[];
   }) => Promise<void>;
   typingReaction?: string;
   ackReactionMessageTs?: string;
   ackReactionPromise?: Promise<boolean> | null;
+  relayIdentity?: { username?: string; iconUrl?: string; iconEmoji?: string };
+  eventScope?: {
+    apiAppId: string;
+    enterpriseId: string;
+    isEnterpriseInstall: true;
+    teamId: string;
+    client: Record<string, unknown>;
+  };
 }) {
   const routeSessionKey = params?.route?.sessionKey ?? "agent:agent-1:slack:C123";
   const mainSessionKey = params?.route?.mainSessionKey ?? "main";
@@ -326,6 +383,8 @@ function createPreparedSlackMessage(params?: {
       accountId: "default",
       config: params?.accountConfig ?? {},
     },
+    relayIdentity: params?.relayIdentity,
+    eventScope: params?.eventScope,
     message,
     route: {
       agentId: "agent-1",
@@ -361,6 +420,13 @@ async function dispatchNativeProgressScenario(params: {
   finalPayload?: { text: string; isError?: boolean };
   progress?: { label?: string; maxLineChars?: number; nativeTaskCards?: true; render?: "rich" };
   replyToMode?: "off" | "first" | "all" | "batched";
+  eventScope?: {
+    apiAppId: string;
+    enterpriseId: string;
+    isEnterpriseInstall: true;
+    teamId: string;
+    client: Record<string, unknown>;
+  };
 }) {
   mockedNativeStreaming = true;
   mockedSlackStreamingMode = "progress";
@@ -372,6 +438,7 @@ async function dispatchNativeProgressScenario(params: {
   await dispatchPreparedSlackMessage(
     createPreparedSlackMessage({
       replyToMode: params.replyToMode,
+      eventScope: params.eventScope,
       accountConfig: {
         streaming: {
           mode: "progress",
@@ -470,11 +537,10 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", async (importOriginal) => {
             : params.exitCode != null
               ? `exit ${params.exitCode}`
               : params.status;
+        const id = params.toolCallId ? `command:${params.toolCallId}` : params.itemId;
         return {
           kind: "command-output",
-          ...((params.itemId ?? params.toolCallId)
-            ? { id: params.itemId ?? params.toolCallId }
-            : {}),
+          ...(id ? { id } : {}),
           text: status ?? params.title ?? params.name ?? "exec",
           label: params.name ?? "exec",
           ...(status ? { status } : {}),
@@ -542,16 +608,25 @@ vi.mock("openclaw/plugin-sdk/channel-outbound", async (importOriginal) => {
           "status" &&
         (params.itemKind === "command" || params.name === "exec")
       ) {
+        const id = params.toolCallId ? `command:${params.toolCallId}` : params.itemId;
         return {
           kind: "item",
+          ...(id ? { id } : {}),
           text: "🛠️ Exec",
           label: "Exec",
         };
       }
       const text = params.progressText ?? params.summary ?? params.title ?? params.name;
+      const id =
+        params.itemKind === "command" || params.name === "exec"
+          ? params.toolCallId
+            ? `command:${params.toolCallId}`
+            : params.itemId
+          : undefined;
       return text
         ? {
             kind: "item",
+            ...(id ? { id } : {}),
             text,
             label: params.title ?? params.name ?? "Update",
           }
@@ -776,7 +851,7 @@ vi.mock("../../limits.js", () => ({
 }));
 
 vi.mock("../../sent-thread-cache.js", () => ({
-  recordSlackThreadParticipation: () => {},
+  recordSlackThreadParticipation: recordSlackThreadParticipationMock,
 }));
 
 vi.mock("../../stream-mode.js", () => ({
@@ -785,7 +860,6 @@ vi.mock("../../stream-mode.js", () => ({
     rendered: incoming,
     source: incoming,
   }),
-  buildStatusFinalPreviewText: () => "status",
   resolveSlackStreamingConfig: () => ({
     mode: mockedSlackStreamingMode,
     nativeStreaming: mockedNativeStreaming,
@@ -895,6 +969,7 @@ vi.mock("../reply.runtime.js", () => ({
       onItemEvent?: (payload: {
         kind?: string;
         itemId?: string;
+        toolCallId?: string;
         progressText?: string;
         summary?: string;
         title?: string;
@@ -902,6 +977,15 @@ vi.mock("../reply.runtime.js", () => ({
         phase?: string;
         status?: string;
         meta?: string;
+      }) => Promise<void> | void;
+      onCommandOutput?: (payload: {
+        itemId?: string;
+        toolCallId?: string;
+        phase?: string;
+        title?: string;
+        name?: string;
+        status?: string;
+        exitCode?: number | null;
       }) => Promise<void> | void;
       onToolStart?: (payload: {
         itemId?: string;
@@ -938,6 +1022,7 @@ vi.mock("../reply.runtime.js", () => ({
           await params.replyOptions?.onItemEvent?.({
             kind: entry.itemKind,
             itemId: entry.itemId,
+            toolCallId: entry.toolCallId,
             progressText: entry.progressText,
             summary: entry.summary,
             title: entry.title,
@@ -945,6 +1030,16 @@ vi.mock("../reply.runtime.js", () => ({
             phase: entry.phase,
             status: entry.status,
             meta: entry.meta,
+          });
+        } else if (entry.kind === "command_output") {
+          await params.replyOptions?.onCommandOutput?.({
+            itemId: entry.itemId,
+            toolCallId: entry.toolCallId,
+            phase: entry.phase,
+            title: entry.title,
+            name: entry.name,
+            status: entry.status,
+            exitCode: entry.exitCode,
           });
         } else if (entry.kind === "tool_start") {
           await params.replyOptions?.onToolStart?.({
@@ -1153,6 +1248,7 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     postMessageMock.mockClear();
     chatUpdateMock.mockClear();
     recordInboundSessionMock.mockReset();
+    recordSlackThreadParticipationMock.mockReset();
     updateLastRouteMock.mockReset();
     appendSlackStreamMock.mockReset();
     startSlackStreamMock.mockReset();
@@ -1200,6 +1296,31 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     expect(finalizeSlackPreviewEditMock).toHaveBeenCalledTimes(1);
     expect(deliverRepliesMock).toHaveBeenCalledTimes(1);
     expectDeliverReplyCall(0, FINAL_REPLY_TEXT);
+  });
+
+  it("uses the relay identity when the agent has no explicit Slack identity", async () => {
+    const relayIdentity = { username: "Nik Team Claw" };
+
+    await dispatchPreparedSlackMessage(createPreparedSlackMessage({ relayIdentity }));
+
+    expect(createSlackDraftStreamMock).not.toHaveBeenCalled();
+    expect(finalizeSlackPreviewEditMock).not.toHaveBeenCalled();
+    expect(deliverRepliesMock).toHaveBeenCalledTimes(1);
+    expectDeliverReplyCall(0, FINAL_REPLY_TEXT, { identity: relayIdentity });
+  });
+
+  it("uses supported native Slack streaming authorship when a custom identity is active", async () => {
+    mockedNativeStreaming = true;
+    const relayIdentity = { username: "Nik Team Claw" };
+
+    await dispatchPreparedSlackMessage(createPreparedSlackMessage({ relayIdentity }));
+
+    expectMockCallArgFields(startSlackStreamMock, 0, "Slack stream start params", {
+      text: FINAL_REPLY_TEXT,
+      identity: relayIdentity,
+    });
+    expect(createSlackDraftStreamMock).not.toHaveBeenCalled();
+    expect(deliverRepliesMock).not.toHaveBeenCalled();
   });
 
   it("does not create a Slack thread for top-level messages when replyToMode is off", async () => {
@@ -1538,6 +1659,74 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     expect(draftStream.clear).not.toHaveBeenCalled();
   });
 
+  it("finalizes native chart blocks with accessible preview text", async () => {
+    const draftStream = {
+      ...createDraftStreamStub(),
+      flush: vi.fn(noopAsync),
+      clear: vi.fn(noopAsync),
+      discardPending: vi.fn(noopAsync),
+      seal: vi.fn(noopAsync),
+    };
+    const accessibleText = "Quarterly results\n\nRevenue (bar chart)\n- USD: Q1: 12; Q2: 18";
+    mockedSlackReplyBlocks = [
+      {
+        type: "data_visualization",
+        title: "Revenue",
+        chart: {
+          type: "bar",
+          series: [
+            {
+              name: "USD",
+              data: [
+                { label: "Q1", value: 12 },
+                { label: "Q2", value: 18 },
+              ],
+            },
+          ],
+          axis_config: { categories: ["Q1", "Q2"] },
+        },
+      },
+    ];
+    createSlackDraftStreamMock.mockReturnValueOnce(draftStream);
+    finalizeSlackPreviewEditMock.mockResolvedValueOnce(undefined);
+    mockedDispatchSequence = [
+      {
+        kind: "final",
+        payload: {
+          text: "Quarterly results",
+          presentation: {
+            blocks: [
+              {
+                type: "chart",
+                chartType: "bar",
+                title: "Revenue",
+                categories: ["Q1", "Q2"],
+                series: [{ name: "USD", values: [12, 18] }],
+              },
+            ],
+          },
+        },
+      },
+    ];
+
+    await dispatchPreparedSlackMessage(createPreparedSlackMessage());
+
+    expectMockCallArgFields(finalizeSlackPreviewEditMock, 0, "chart preview edit params", {
+      channelId: "C123",
+      messageId: "171234.567",
+      text: accessibleText,
+      blocks: mockedSlackReplyBlocks,
+      threadTs: THREAD_TS,
+    });
+    expectMockCallArgFields(emitSlackMessageSentHooksMock, 0, "chart preview message_sent", {
+      content: accessibleText,
+      success: true,
+      messageId: "171234.567",
+    });
+    expect(deliverRepliesMock).not.toHaveBeenCalled();
+    expect(draftStream.clear).not.toHaveBeenCalled();
+  });
+
   it("does not clear a finalized Slack draft when a later tool warning is delivered", async () => {
     const draftStream = {
       ...createDraftStreamStub(),
@@ -1640,6 +1829,12 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
       channelId: "C123",
       threadTs: THREAD_TS,
       status: "is typing...",
+      loadingMessages: [
+        "Reading the thread...",
+        "Checking context...",
+        "Working through the request...",
+        "Putting it all together...",
+      ],
     });
     expect(setSlackThreadStatus).toHaveBeenCalledWith({
       channelId: "C123",
@@ -1676,12 +1871,48 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     );
 
     expect(capturedReplyOptions?.disableBlockStreaming).toBe(true);
+    expect(capturedReplyOptions?.allowProgressCallbacksWhenSourceDeliverySuppressed).toBe(true);
+    expect(capturedReplyOptions?.allowToolLifecycleWhenProgressHidden).toBe(true);
     expectRecordFields(requireRecord(capturedStatusReactionOptions, "status reaction options"), {
       enabled: true,
       initialEmoji: "eyes",
     });
     expect(statusReactionControllerMock.setQueued).toHaveBeenCalledTimes(1);
     expect(statusReactionControllerMock.setDone).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Slack lifecycle reactions off by default when an ack reaction exists", async () => {
+    await dispatchPreparedSlackMessage(
+      createPreparedSlackMessage({
+        ackReactionMessageTs: "171234.111",
+        ackReactionPromise: Promise.resolve(true),
+      }),
+    );
+
+    expectRecordFields(requireRecord(capturedStatusReactionOptions, "status reaction options"), {
+      enabled: false,
+      initialEmoji: "eyes",
+    });
+    expect(statusReactionControllerMock.setQueued).not.toHaveBeenCalled();
+    expect(statusReactionControllerMock.setDone).not.toHaveBeenCalled();
+  });
+
+  it("keeps Slack lifecycle reactions off for ambient room-event acks", async () => {
+    await dispatchPreparedSlackMessage(
+      createPreparedSlackMessage({
+        cfg: { messages: { statusReactions: { enabled: true } } },
+        ctxPayload: { ChatType: "channel", InboundEventKind: "room_event" },
+        ackReactionMessageTs: "171234.111",
+        ackReactionPromise: Promise.resolve(true),
+      }),
+    );
+
+    expectRecordFields(requireRecord(capturedStatusReactionOptions, "status reaction options"), {
+      enabled: false,
+      initialEmoji: "eyes",
+    });
+    expect(statusReactionControllerMock.setQueued).not.toHaveBeenCalled();
+    expect(statusReactionControllerMock.setDone).not.toHaveBeenCalled();
   });
 
   it("escapes Slack mrkdwn in tool progress preview labels", async () => {
@@ -1750,6 +1981,31 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     );
     const updates = draftStream.update.mock.calls.map((call) => String(call[0]));
     expect(updates.join("\n")).not.toContain("Checking Reading");
+  });
+
+  it("extracts mm:think reasoning snapshots for Slack progress draft previews", async () => {
+    const draftStream = createDraftStreamStub();
+    createSlackDraftStreamMock.mockReturnValueOnce(draftStream);
+    mockedDispatchSequence = [];
+    mockedReplyOptionEvents = [
+      {
+        kind: "reasoning",
+        text: "<mm:think>Reading\nChecking</mm:think>",
+        isReasoningSnapshot: true,
+      },
+    ];
+
+    await dispatchPreparedSlackMessage(
+      createPreparedSlackMessage({
+        accountConfig: { streaming: { progress: { label: "Shelling" } } },
+      }),
+    );
+
+    expect(draftStream.update).toHaveBeenLastCalledWith(
+      ["Shelling", "• Reading Checking"].join("\n"),
+    );
+    const updates = draftStream.update.mock.calls.map((call) => String(call[0]));
+    expect(updates.join("\n")).toContain("Reading Checking");
   });
 
   it("keeps plain Slack reasoning content that starts with Thinking", async () => {
@@ -2494,6 +2750,69 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     expectDeliverReplyCall(0, FINAL_REPLY_TEXT);
   });
 
+  it("uses the enterprise event team as the native progress stream fallback", async () => {
+    const eventClient = {
+      chat: { postMessage: postMessageMock, update: chatUpdateMock },
+      users: {
+        info: vi.fn<() => Promise<{ user: Record<string, never> }>>(async () => ({ user: {} })),
+      },
+    };
+
+    await dispatchNativeProgressScenario({
+      finalPayload: { text: FINAL_REPLY_TEXT },
+      events: [{ kind: "item", progressText: "checking" }],
+      eventScope: {
+        apiAppId: "A_TEST",
+        enterpriseId: "E_TEST",
+        isEnterpriseInstall: true,
+        teamId: "T_ENTERPRISE",
+        client: eventClient,
+      },
+    });
+
+    expectMockCallArgFields(startSlackStreamMock, 0, "enterprise progress stream start params", {
+      client: eventClient,
+      teamId: "T_ENTERPRISE",
+    });
+  });
+
+  it("reuses native Slack progress task identity across command item and output events", async () => {
+    await dispatchNativeProgressScenario({
+      finalPayload: { text: FINAL_REPLY_TEXT },
+      events: [
+        {
+          kind: "item",
+          itemId: "tool:call-1",
+          toolCallId: "call-1",
+          itemKind: "command",
+          name: "bash",
+          phase: "update",
+          status: "running",
+          progressText: "install dependencies",
+        },
+        {
+          kind: "command_output",
+          itemId: "tool:call-1-output",
+          toolCallId: "call-1",
+          name: "bash",
+          phase: "end",
+          exitCode: 0,
+        },
+      ],
+    });
+
+    const taskUpdates = collectNativeTaskUpdates();
+    expect([...new Set(taskUpdates.map((task) => task.id))]).toEqual([
+      expect.stringMatching(/^command_call_1_[a-f0-9]{8}$/),
+    ]);
+    expect(taskUpdates.at(0)?.id).toEqual(expect.stringMatching(/^command_call_1_[a-f0-9]{8}$/));
+    expect(taskUpdates).toContainEqual(
+      taskUpdate(taskUpdates.at(0)?.id, "bash — completed", "complete"),
+    );
+    expect(deliverRepliesMock).toHaveBeenCalledTimes(1);
+    expectDeliverReplyCall(0, FINAL_REPLY_TEXT);
+  });
+
   it("keeps final fallback in the planned thread when native Slack progress start fails", async () => {
     startSlackStreamMock.mockRejectedValueOnce(new Error("start stream failed"));
     mockedReplyThreadTsSequence = [THREAD_TS, undefined];
@@ -2884,6 +3203,33 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     expect(deliverRepliesMock).not.toHaveBeenCalled();
   });
 
+  it("uses the enterprise event team as the native text stream fallback", async () => {
+    mockedNativeStreaming = true;
+    const eventClient = {
+      chat: { postMessage: postMessageMock, update: chatUpdateMock },
+      users: {
+        info: vi.fn<() => Promise<{ user: Record<string, never> }>>(async () => ({ user: {} })),
+      },
+    };
+
+    await dispatchPreparedSlackMessage(
+      createPreparedSlackMessage({
+        eventScope: {
+          apiAppId: "A_TEST",
+          enterpriseId: "E_TEST",
+          isEnterpriseInstall: true,
+          teamId: "T_ENTERPRISE",
+          client: eventClient,
+        },
+      }),
+    );
+
+    expectMockCallArgFields(startSlackStreamMock, 0, "enterprise Slack stream start params", {
+      client: eventClient,
+      teamId: "T_ENTERPRISE",
+    });
+  });
+
   it("suppresses reasoning payloads before Slack native streaming delivery", async () => {
     mockedNativeStreaming = true;
     mockedDispatchSequence = [
@@ -3241,6 +3587,86 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     ]);
   });
 
+  it("keeps chart semantics singular when TTS preview finalization fails", async () => {
+    const draftStream = {
+      ...createDraftStreamStub(),
+      flush: vi.fn(noopAsync),
+      clear: vi.fn(noopAsync),
+      discardPending: vi.fn(noopAsync),
+      seal: vi.fn(noopAsync),
+    };
+    mockedSlackReplyBlocks = [
+      {
+        type: "data_visualization",
+        title: "Revenue",
+        chart: {
+          type: "bar",
+          series: [
+            {
+              name: "USD",
+              data: [
+                { label: "Q1", value: 12 },
+                { label: "Q2", value: 18 },
+              ],
+            },
+          ],
+          axis_config: { categories: ["Q1", "Q2"] },
+        },
+      },
+    ];
+    createSlackDraftStreamMock.mockReturnValueOnce(draftStream);
+    mockedReplyThreadTsSequence = [undefined];
+    mockedDispatchSequence = [
+      {
+        kind: "final",
+        payload: {
+          mediaUrl: "https://example.com/tts.mp3",
+          audioAsVoice: true,
+          spokenText: "Spoken answer",
+          ttsSupplement: { spokenText: "Spoken answer" },
+          presentation: {
+            blocks: [
+              {
+                type: "chart",
+                chartType: "bar",
+                title: "Revenue",
+                categories: ["Q1", "Q2"],
+                series: [{ name: "USD", values: [12, 18] }],
+              },
+            ],
+          },
+        },
+      },
+    ];
+
+    await dispatchPreparedSlackMessage(createPreparedSlackMessage());
+
+    const delivered = requireRecord(
+      requireMockCall(deliverRepliesMock, 0, "deliver replies")[0],
+      "deliver replies params",
+    );
+    expect(delivered.replies).toEqual([
+      {
+        text: "Spoken answer",
+        mediaUrl: "https://example.com/tts.mp3",
+        audioAsVoice: true,
+        spokenText: "Spoken answer",
+        ttsSupplement: { spokenText: "Spoken answer" },
+        presentation: {
+          blocks: [
+            {
+              type: "chart",
+              chartType: "bar",
+              title: "Revenue",
+              categories: ["Q1", "Q2"],
+              series: [{ name: "USD", values: [12, 18] }],
+            },
+          ],
+        },
+      },
+    ]);
+  });
+
   it("falls back with visible text when TTS supplement preview has no message id", async () => {
     const draftStream = {
       ...createDraftStreamStub(),
@@ -3365,6 +3791,67 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     expect(deliverRepliesMock).toHaveBeenCalledTimes(1);
     expectDeliverReplyCall(0, FINAL_REPLY_TEXT);
     expect(session.stopped).toBe(true);
+  });
+
+  it("routes pending native stream text through chunked sender for unexpected finalize failures", async () => {
+    mockedNativeStreaming = true;
+    const session = {
+      channel: "C123",
+      threadTs: THREAD_TS,
+      stopped: false,
+      delivered: false,
+      pendingText: FINAL_REPLY_TEXT,
+    };
+    startSlackStreamMock.mockResolvedValueOnce(session);
+    stopSlackStreamMock.mockRejectedValueOnce(
+      new TestSlackStreamNotDeliveredError(
+        FINAL_REPLY_TEXT,
+        "method_not_supported_for_channel_type",
+      ),
+    );
+
+    await dispatchPreparedSlackMessage(createPreparedSlackMessage());
+
+    expect(postMessageMock).not.toHaveBeenCalled();
+    expect(deliverRepliesMock).toHaveBeenCalledTimes(1);
+    expect(deliverRepliesMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        replyThreadTs: THREAD_TS,
+        replies: [expect.objectContaining({ text: FINAL_REPLY_TEXT })],
+      }),
+    );
+    expect(session.stopped).toBe(true);
+  });
+
+  it("fails dispatch when an unexpected finalize fallback cannot deliver a buffered tail", async () => {
+    mockedNativeStreaming = true;
+    const session = {
+      channel: "C123",
+      threadTs: THREAD_TS,
+      stopped: false,
+      delivered: true,
+      pendingText: "buffered tail",
+    };
+    startSlackStreamMock.mockResolvedValueOnce(session);
+    stopSlackStreamMock.mockRejectedValueOnce(
+      new TestSlackStreamNotDeliveredError(
+        "buffered tail",
+        "method_not_supported_for_channel_type",
+      ),
+    );
+    deliverRepliesMock.mockRejectedValueOnce(new Error("fallback send failed"));
+
+    await expect(dispatchPreparedSlackMessage(createPreparedSlackMessage())).rejects.toThrowError(
+      "slack-stream not delivered: method_not_supported_for_channel_type",
+    );
+
+    expectDeliverReplyCall(0, "buffered tail");
+    expect(recordSlackThreadParticipationMock).toHaveBeenCalledWith(
+      expect.any(String),
+      "C123",
+      THREAD_TS,
+      expect.any(Object),
+    );
   });
 
   it("routes all pending native stream text through chunked sender when an append flush fails", async () => {

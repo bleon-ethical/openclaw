@@ -1,7 +1,7 @@
 /**
  * Gateway tool-resolution tests.
  */
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveGatewayScopedTools } from "./tool-resolution.js";
 
@@ -69,5 +69,49 @@ describe("resolveGatewayScopedTools", () => {
     });
 
     expect(result.tools.some((tool) => tool.name === "message")).toBe(false);
+  });
+
+  it("exposes task suggestion tools only for actionable loopback turns", () => {
+    const withoutActions = resolveGatewayScopedTools({
+      cfg: {} as OpenClawConfig,
+      sessionKey: "agent:main:main",
+      surface: "loopback",
+    });
+    const withActions = resolveGatewayScopedTools({
+      cfg: {} as OpenClawConfig,
+      sessionKey: "agent:main:main",
+      taskSuggestionDeliveryMode: "gateway",
+      surface: "loopback",
+    });
+
+    expect(withoutActions.tools.some((tool) => tool.name === "spawn_task")).toBe(false);
+    expect(withActions.tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["spawn_task", "dismiss_task"]),
+    );
+  });
+
+  it("passes loopback yield context into sessions_yield", async () => {
+    const onYield = vi.fn();
+    const result = resolveGatewayScopedTools({
+      cfg: { tools: { profile: "minimal", alsoAllow: ["sessions_yield"] } } as OpenClawConfig,
+      sessionKey: "agent:main:telegram:group:-100123",
+      sessionId: "session-123",
+      onYield,
+      surface: "loopback",
+    });
+    const yieldTool = result.tools.find((tool) => tool.name === "sessions_yield");
+    if (!yieldTool) {
+      throw new Error("expected sessions_yield tool");
+    }
+
+    const toolResult = await yieldTool.execute("tool-call-1", {
+      message: "waiting on subagents",
+    });
+
+    expect(onYield).toHaveBeenCalledWith("waiting on subagents");
+    expect(toolResult.details).toEqual({
+      status: "yielded",
+      message: "waiting on subagents",
+    });
   });
 });

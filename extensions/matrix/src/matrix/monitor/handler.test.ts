@@ -265,6 +265,23 @@ function expectDeliveredMediaReply() {
 }
 
 describe("matrix monitor handler pairing account scope", () => {
+  it("keeps inbound log previews UTF-16 well-formed at the limit", async () => {
+    const logVerboseMessage = vi.fn();
+    const { handler } = createMatrixHandlerTestHarness({ logVerboseMessage });
+
+    await handler(
+      "!room:example.org",
+      createMatrixTextMessageEvent({
+        eventId: "$event-preview",
+        body: `${"x".repeat(199)}🚀tail`,
+      }),
+    );
+
+    expect(logVerboseMessage).toHaveBeenCalledWith(
+      `matrix inbound: room=!room:example.org from=@user:example.org preview="${"x".repeat(199)}"`,
+    );
+  });
+
   it("caches account-scoped allowFrom store reads on hot path", async () => {
     const readAllowFromStore = vi.fn(async () => [] as string[]);
     sendMessageMatrixMock.mockClear();
@@ -634,6 +651,7 @@ describe("matrix monitor handler pairing account scope", () => {
     );
 
     expect(recordInboundSession).toHaveBeenCalled();
+    expect(runPrepared.mock.calls[0]?.[0].ctxPayload.GroupRequireMention).toBe(false);
     expect(runPrepared.mock.calls[0]?.[0].botLoopProtection).toEqual({
       scopeId: "ops",
       conversationId: "!room:example.org",
@@ -905,6 +923,31 @@ describe("matrix monitor handler pairing account scope", () => {
           msgtype: "m.text",
           body: "@欢欢 please reply",
           formatted_body: '<a href="https://matrix.to/#/@bot:example.org">@欢欢</a> please reply',
+          "m.mentions": { user_ids: ["@bot:example.org"] },
+        },
+      }),
+    );
+
+    expect(recordInboundSession).toHaveBeenCalled();
+  });
+
+  it("processes room messages mentioned via bracketed @displayName in formatted_body", async () => {
+    const recordInboundSession = vi.fn(async () => {});
+    const { handler } = createMatrixHandlerTestHarness({
+      isDirectMessage: false,
+      getMemberDisplayName: async () => "Display Name",
+      recordInboundSession,
+    });
+
+    await handler(
+      "!room:example.org",
+      createMatrixRoomMessageEvent({
+        eventId: "$bracketed-display-name-mention",
+        content: {
+          msgtype: "m.text",
+          body: "@[Display Name] please reply",
+          formatted_body:
+            '<a href="https://matrix.to/#/@bot:example.org">@[Display Name]</a> please reply',
           "m.mentions": { user_ids: ["@bot:example.org"] },
         },
       }),
@@ -2950,12 +2993,24 @@ describe("matrix monitor handler draft streaming", () => {
     ) => Promise<void> | void;
     onAssistantMessageStart?: () => void;
     suppressDefaultToolProgressMessages?: boolean;
-    onToolStart?: (payload: { name?: string }) => Promise<void>;
+    onToolStart?: (payload: {
+      itemId?: string;
+      toolCallId?: string;
+      name?: string;
+      phase?: string;
+      args?: Record<string, unknown>;
+      detailMode?: "explain" | "raw";
+    }) => Promise<void>;
     onItemEvent?: (payload: {
+      itemId?: string;
+      toolCallId?: string;
       progressText?: string;
       summary?: string;
       title?: string;
       name?: string;
+      kind?: string;
+      phase?: string;
+      status?: string;
     }) => Promise<void>;
     onPlanUpdate?: (payload: {
       phase: string;
@@ -2964,15 +3019,24 @@ describe("matrix monitor handler draft streaming", () => {
     }) => Promise<void>;
     onApprovalEvent?: (payload: { phase: string; command?: string }) => Promise<void>;
     onCommandOutput?: (payload: {
+      itemId?: string;
+      toolCallId?: string;
       phase: string;
       name?: string;
       exitCode?: number;
+      status?: string;
       title?: string;
     }) => Promise<void>;
     onPatchSummary?: (payload: {
+      itemId?: string;
+      toolCallId?: string;
       phase: string;
+      name?: string;
       summary?: string;
       title?: string;
+      added?: string[];
+      modified?: string[];
+      deleted?: string[];
     }) => Promise<void>;
     disableBlockStreaming?: boolean;
   };
@@ -3136,6 +3200,193 @@ describe("matrix monitor handler draft streaming", () => {
     });
     expect(singleTextMessageBody()).toBe("- `second`");
     await finish();
+  });
+
+  it("keeps truncated Matrix tool progress UTF-16 safe", async () => {
+    const { dispatch } = createStreamingHarness({
+      streaming: "progress",
+      previewToolProgressEnabled: true,
+      accountConfig: {
+        streaming: {
+          mode: "progress",
+          progress: { label: false, maxLineChars: 500 },
+        },
+      } as never,
+    });
+    const { opts, finish } = await dispatch();
+    const progressPrefix = "x".repeat(298);
+
+    const progressText = `${progressPrefix}🎉tail`;
+    await opts.onItemEvent?.({ progressText });
+    await opts.onItemEvent?.({ progressText });
+
+    await vi.waitFor(() => {
+      expect(sendSingleTextMessageMatrixMock).toHaveBeenCalledTimes(1);
+    });
+    expect(singleTextMessageBody()).toBe(`- \`${progressPrefix}...\``);
+    await finish();
+  });
+
+  it("replaces recovered Matrix command progress instead of leaving stale failed text", async () => {
+    const { dispatch } = createStreamingHarness({
+      streaming: "progress",
+      previewToolProgressEnabled: true,
+      accountConfig: {
+        streaming: { mode: "progress", progress: { label: "Working" } },
+      } as never,
+    });
+    const { opts, finish } = await dispatch();
+
+    await opts.onItemEvent?.({
+      itemId: "command-1",
+      kind: "command",
+      name: "exec",
+      phase: "end",
+      status: "failed",
+      progressText: "run openclaw cron -> run jq (agent) failed",
+    });
+    await opts.onItemEvent?.({
+      itemId: "command-1",
+      kind: "command",
+      name: "exec",
+      phase: "end",
+      status: "failed",
+      progressText: "run openclaw cron -> run jq (agent) failed",
+    });
+
+    await vi.waitFor(() => {
+      expect(sendSingleTextMessageMatrixMock).toHaveBeenCalledTimes(1);
+    });
+    expect(singleTextMessageBody()).toContain("failed");
+
+    await opts.onCommandOutput?.({
+      itemId: "command-1",
+      toolCallId: "call-1",
+      phase: "end",
+      name: "exec",
+      status: "completed",
+      exitCode: 0,
+    });
+
+    await finish();
+    expect(editMessageMatrixMock).toHaveBeenCalledWith(
+      "!room:example.org",
+      "$draft1",
+      expect.stringContaining("Exec"),
+      expect.any(Object),
+    );
+    const recoveredEdit = mockCalls(editMessageMatrixMock, "editMessageMatrix").find(
+      ([, eventId, body]) => eventId === "$draft1" && typeof body === "string",
+    );
+    expect(recoveredEdit?.[2]).not.toContain("completed");
+    expect(recoveredEdit?.[2]).not.toContain("failed");
+    expect(recoveredEdit?.[2]).not.toContain("run openclaw cron -> run jq");
+  });
+
+  it("replaces Matrix tool-start progress when command output completes", async () => {
+    const { dispatch } = createStreamingHarness({
+      streaming: "progress",
+      previewToolProgressEnabled: true,
+      accountConfig: {
+        streaming: { mode: "progress", progress: { label: "Working" } },
+      } as never,
+    });
+    const { opts, finish } = await dispatch();
+
+    await opts.onToolStart?.({
+      itemId: "fc-call-2",
+      toolCallId: "call-2",
+      name: "exec",
+      phase: "start",
+      args: { command: "npm install" },
+    });
+    await opts.onToolStart?.({
+      itemId: "fc-call-2",
+      toolCallId: "call-2",
+      name: "exec",
+      phase: "update",
+      args: { command: "npm install" },
+    });
+
+    await vi.waitFor(() => {
+      expect(sendSingleTextMessageMatrixMock).toHaveBeenCalledTimes(1);
+    });
+    expect(singleTextMessageBody()).toContain("install dependencies");
+
+    await opts.onItemEvent?.({
+      itemId: "fc-call-2",
+      toolCallId: "call-2",
+      kind: "command",
+      name: "exec",
+      phase: "update",
+      progressText: "install dependencies",
+    });
+
+    await opts.onCommandOutput?.({
+      itemId: "fc-call-2-output",
+      toolCallId: "call-2",
+      phase: "end",
+      name: "exec",
+      status: "completed",
+      exitCode: 0,
+    });
+
+    await finish();
+    const completedEdit = mockCalls(editMessageMatrixMock, "editMessageMatrix").find(
+      ([, eventId, body]) =>
+        eventId === "$draft1" && typeof body === "string" && body.includes("completed"),
+    );
+    expect(completedEdit).toBeUndefined();
+    expect(singleTextMessageBody()).toContain("install dependencies");
+  });
+
+  it("replaces Matrix patch progress when the patch summary completes", async () => {
+    const { dispatch } = createStreamingHarness({
+      streaming: "progress",
+      previewToolProgressEnabled: true,
+      accountConfig: {
+        streaming: { mode: "progress", progress: { label: "Working" } },
+      } as never,
+    });
+    const { opts, finish } = await dispatch();
+
+    await opts.onItemEvent?.({
+      itemId: "patch:call-3",
+      toolCallId: "call-3",
+      kind: "patch",
+      name: "apply_patch",
+      phase: "update",
+      progressText: "updating Matrix progress handling",
+    });
+    await opts.onItemEvent?.({
+      itemId: "patch:call-3",
+      toolCallId: "call-3",
+      kind: "patch",
+      name: "apply_patch",
+      phase: "update",
+      progressText: "updating Matrix progress handling",
+    });
+
+    await vi.waitFor(() => {
+      expect(sendSingleTextMessageMatrixMock).toHaveBeenCalledTimes(1);
+    });
+    expect(singleTextMessageBody()).toContain("updating Matrix progress handling");
+
+    await opts.onPatchSummary?.({
+      itemId: "patch:call-3",
+      toolCallId: "call-3",
+      phase: "end",
+      name: "apply_patch",
+      modified: ["extensions/matrix/src/matrix/monitor/handler.ts"],
+      summary: "1 file modified",
+    });
+
+    await finish();
+    const patchEdit = mockCalls(editMessageMatrixMock, "editMessageMatrix").find(
+      ([, eventId, body]) =>
+        eventId === "$draft1" && typeof body === "string" && body.includes("1 file modified"),
+    );
+    expect(patchEdit?.[2]).not.toContain("updating Matrix progress handling");
   });
 
   it("keeps Matrix tool progress mentions inside code formatting", async () => {

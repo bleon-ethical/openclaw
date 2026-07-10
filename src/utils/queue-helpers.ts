@@ -4,18 +4,20 @@
  * Queue owners use these helpers to cap pending work, summarize dropped items,
  * debounce drains, and force individual collection when cross-channel ordering matters.
  */
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+
 /** Mutable summary state for a capped queue. */
-export type QueueSummaryState = {
+type QueueSummaryState = {
   dropPolicy: "summarize" | "old" | "new";
   droppedCount: number;
   summaryLines: string[];
 };
 
 /** Queue overflow strategy. */
-export type QueueDropPolicy = QueueSummaryState["dropPolicy"];
+type QueueDropPolicy = QueueSummaryState["dropPolicy"];
 
 /** Generic capped queue state with shared overflow summary fields. */
-export type QueueState<T> = QueueSummaryState & {
+type QueueState<T> = QueueSummaryState & {
   items: T[];
   cap: number;
 };
@@ -71,15 +73,15 @@ export function applyQueueRuntimeSettings<TMode extends string>(params: {
 }
 
 /** Trim queue summary text to a bounded single-line preview. */
-export function elideQueueText(text: string, limit = 140): string {
+function elideQueueText(text: string, limit = 140): string {
   if (text.length <= limit) {
     return text;
   }
-  return `${text.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+  return `${truncateUtf16Safe(text, Math.max(0, limit - 1)).trimEnd()}…`;
 }
 
 /** Normalize whitespace and elide one dropped item for queue summaries. */
-export function buildQueueSummaryLine(text: string, limit = 160): string {
+function buildQueueSummaryLine(text: string, limit = 160): string {
   const cleaned = text.replace(/\s+/g, " ").trim();
   return elideQueueText(cleaned, limit);
 }
@@ -96,22 +98,41 @@ export function shouldSkipQueueItem<T>(params: {
   return params.dedupe(params.item, params.items);
 }
 
+/** Count identities that are still pending in the queue, excluding active deliveries. */
+export function countPendingQueueItems<T>(items: readonly T[], inFlight?: ReadonlySet<T>): number {
+  if (!inFlight || inFlight.size === 0) {
+    return items.length;
+  }
+  return items.reduce((count, item) => count + (inFlight.has(item) ? 0 : 1), 0);
+}
+
 /** Apply overflow policy before enqueueing another item. */
 export function applyQueueDropPolicy<T>(params: {
   queue: QueueState<T>;
   summarize: (item: T) => string;
   summaryLimit?: number;
   onDrop?: (items: T[]) => void;
+  inFlight?: ReadonlySet<T>;
 }): boolean {
   const cap = params.queue.cap;
-  if (cap <= 0 || params.queue.items.length < cap) {
+  const pendingCount = countPendingQueueItems(params.queue.items, params.inFlight);
+  if (cap <= 0 || pendingCount < cap) {
     return true;
   }
   if (params.queue.dropPolicy === "new") {
     return false;
   }
-  const dropCount = params.queue.items.length - cap + 1;
-  const dropped = params.queue.items.splice(0, dropCount);
+  const dropCount = pendingCount - cap + 1;
+  const dropped: T[] = [];
+  // Active identities remain in the shared array until delivery succeeds; evict only pending work.
+  for (let index = 0; dropped.length < dropCount; ) {
+    const item = params.queue.items[index];
+    if (params.inFlight?.has(item)) {
+      index += 1;
+      continue;
+    }
+    dropped.push(...params.queue.items.splice(index, 1));
+  }
   params.onDrop?.(dropped);
   if (params.queue.dropPolicy === "summarize") {
     for (const item of dropped) {
@@ -179,23 +200,33 @@ export function removeQueuedItemsByRef<T>(items: T[], processed: readonly T[]): 
 export async function drainNextQueueItem<T>(
   items: T[],
   run: (item: T) => Promise<void>,
+  inFlight?: Set<T>,
 ): Promise<boolean> {
   const next = items[0];
   if (!next) {
     return false;
   }
-  await run(next);
-  removeQueuedItemsByRef(items, [next]);
+  // Mark the item as in-flight so applyQueueDropPolicy skips it during the
+  // await window when the shared items array is still mutated by enqueuers.
+  inFlight?.add(next);
+  try {
+    await run(next);
+    // Keep the identity protected until its successful by-reference removal.
+    removeQueuedItemsByRef(items, [next]);
+  } finally {
+    inFlight?.delete(next);
+  }
   return true;
 }
 
 /** Drain one item when collect mode requires individual processing. */
-export async function drainCollectItemIfNeeded<T>(params: {
+async function drainCollectItemIfNeeded<T>(params: {
   forceIndividualCollect: boolean;
   isCrossChannel: boolean;
   setForceIndividualCollect?: (next: boolean) => void;
   items: T[];
   run: (item: T) => Promise<void>;
+  inFlight?: Set<T>;
 }): Promise<"skipped" | "drained" | "empty"> {
   if (!params.forceIndividualCollect && !params.isCrossChannel) {
     return "skipped";
@@ -204,7 +235,7 @@ export async function drainCollectItemIfNeeded<T>(params: {
     // Once cross-channel items appear, future collection stays individual to preserve ordering.
     params.setForceIndividualCollect?.(true);
   }
-  const drained = await drainNextQueueItem(params.items, params.run);
+  const drained = await drainNextQueueItem(params.items, params.run, params.inFlight);
   return drained ? "drained" : "empty";
 }
 
@@ -214,6 +245,7 @@ export async function drainCollectQueueStep<T>(params: {
   isCrossChannel: boolean;
   items: T[];
   run: (item: T) => Promise<void>;
+  inFlight?: Set<T>;
 }): Promise<"skipped" | "drained" | "empty"> {
   return await drainCollectItemIfNeeded({
     forceIndividualCollect: params.collectState.forceIndividualCollect,
@@ -223,11 +255,12 @@ export async function drainCollectQueueStep<T>(params: {
     },
     items: params.items,
     run: params.run,
+    inFlight: params.inFlight,
   });
 }
 
 /** Build and consume the queue overflow summary prompt. */
-export function buildQueueSummaryPrompt(params: {
+function buildQueueSummaryPrompt(params: {
   state: QueueSummaryState;
   noun: string;
   title?: string;

@@ -3,7 +3,7 @@ import { parseStrictNonNegativeInteger } from "../infra/parse-finite-number.js";
 import type { CronSchedule } from "./types.js";
 
 /** Default jitter window applied to recurring top-of-hour cron schedules. */
-export const DEFAULT_TOP_OF_HOUR_STAGGER_MS = 5 * 60 * 1000;
+const DEFAULT_TOP_OF_HOUR_STAGGER_MS = 5 * 60 * 1000;
 
 function parseCronFields(expr: string) {
   return expr.trim().split(/\s+/).filter(Boolean);
@@ -44,7 +44,8 @@ export function normalizeCronStaggerMs(raw: unknown): number | undefined {
   if (!Number.isFinite(numeric)) {
     return undefined;
   }
-  return Math.max(0, Math.floor(numeric));
+  const normalized = Math.max(0, Math.floor(numeric));
+  return Number.isSafeInteger(normalized) ? normalized : undefined;
 }
 
 /** Returns the default anti-thundering-herd stagger for top-of-hour recurring schedules. */
